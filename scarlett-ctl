@@ -1,0 +1,997 @@
+#!/usr/bin/env python3
+"""scarlett-ctl — backend for the Omarchy Scarlett control-center plugin.
+
+Talks to Focusrite Scarlett interfaces through the in-kernel scarlett2/FCP
+ALSA driver (via libasound, no extra packages) and to PipeWire for the
+sample-rate and buffer-size clock settings.
+
+Usage:
+  scarlett-ctl daemon            JSON-lines protocol on stdout, commands on stdin
+  scarlett-ctl state             print one state snapshot and exit
+  scarlett-ctl rate <hz|auto>    set the sample rate (runtime + persistent)
+  scarlett-ctl buffer <n|auto>   set the buffer size (quantum)
+  scarlett-ctl clock             print the current clock settings
+  scarlett-ctl firmware          print installed / available firmware
+
+Daemon stdin commands (one per line):
+  set <numid> <v1>[,<v2>...]     write an ALSA control (enum index / bool 0|1 / int)
+  meters on|off                  stream the hardware level meters (~25 Hz)
+  rate <hz>|auto
+  buffer <n>|auto
+  refresh
+  firmware                       re-check installed / available firmware
+  firmware-update                back up settings, flash, restore settings
+
+Daemon stdout messages (one JSON object per line):
+  {"type":"device", "connected":bool, "card":int, "name":str, "usbid":str, "serial":str}
+  {"type":"state",  "controls":{name:{numid,iface,type,min,max,dbMin,dbMax,items,values,rw}}}
+  {"type":"meters", "v":[int...]}
+  {"type":"clock",  ...}           see clock_info()
+  {"type":"firmware", "current", "latest", "updateAvailable", "tool", ...}
+  {"type":"fwprogress", "phase", "label", "percent"}
+  {"type":"fwresult", "ok", "stage": "flashed"|"failed"|"restored", ...}
+  {"type":"error",  "message":str}
+"""
+
+import ctypes
+import ctypes.util
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import time
+
+FOCUSRITE_VENDOR = "1235"
+RATES = [44100, 48000, 88200, 96000, 176400, 192000]
+QUANTA = [32, 64, 128, 256, 512, 1024, 2048]
+
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarchy-scarlett")
+PREFS_PATH = os.path.join(STATE_DIR, "prefs.json")
+PW_CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "pipewire", "pipewire.conf.d")
+PW_CONF_PATH = os.path.join(PW_CONF_DIR, "60-scarlett-clock.conf")
+
+# ---------------------------------------------------------------- libasound
+
+_lib = ctypes.CDLL(ctypes.util.find_library("asound") or "libasound.so.2")
+_p = ctypes.c_void_p
+
+
+def _sig(name, restype, *argtypes):
+    fn = getattr(_lib, name)
+    fn.restype = restype
+    fn.argtypes = list(argtypes)
+    return fn
+
+
+snd_ctl_open = _sig("snd_ctl_open", ctypes.c_int, ctypes.POINTER(_p), ctypes.c_char_p, ctypes.c_int)
+snd_ctl_close = _sig("snd_ctl_close", ctypes.c_int, _p)
+snd_ctl_subscribe_events = _sig("snd_ctl_subscribe_events", ctypes.c_int, _p, ctypes.c_int)
+snd_ctl_poll_descriptors_count = _sig("snd_ctl_poll_descriptors_count", ctypes.c_int, _p)
+snd_ctl_read = _sig("snd_ctl_read", ctypes.c_int, _p, _p)
+snd_ctl_nonblock = _sig("snd_ctl_nonblock", ctypes.c_int, _p, ctypes.c_int)
+
+
+class _Pollfd(ctypes.Structure):
+    _fields_ = [("fd", ctypes.c_int), ("events", ctypes.c_short), ("revents", ctypes.c_short)]
+
+
+snd_ctl_poll_descriptors = _sig("snd_ctl_poll_descriptors", ctypes.c_int, _p, ctypes.POINTER(_Pollfd), ctypes.c_uint)
+
+snd_ctl_elem_list_malloc = _sig("snd_ctl_elem_list_malloc", ctypes.c_int, ctypes.POINTER(_p))
+snd_ctl_elem_list_free = _sig("snd_ctl_elem_list_free", None, _p)
+snd_ctl_elem_list = _sig("snd_ctl_elem_list", ctypes.c_int, _p, _p)
+snd_ctl_elem_list_get_count = _sig("snd_ctl_elem_list_get_count", ctypes.c_uint, _p)
+snd_ctl_elem_list_alloc_space = _sig("snd_ctl_elem_list_alloc_space", ctypes.c_int, _p, ctypes.c_uint)
+snd_ctl_elem_list_free_space = _sig("snd_ctl_elem_list_free_space", None, _p)
+snd_ctl_elem_list_get_numid = _sig("snd_ctl_elem_list_get_numid", ctypes.c_uint, _p, ctypes.c_uint)
+
+snd_ctl_elem_info_malloc = _sig("snd_ctl_elem_info_malloc", ctypes.c_int, ctypes.POINTER(_p))
+snd_ctl_elem_info_free = _sig("snd_ctl_elem_info_free", None, _p)
+snd_ctl_elem_info_set_numid = _sig("snd_ctl_elem_info_set_numid", None, _p, ctypes.c_uint)
+snd_ctl_elem_info = _sig("snd_ctl_elem_info", ctypes.c_int, _p, _p)
+snd_ctl_elem_info_get_name = _sig("snd_ctl_elem_info_get_name", ctypes.c_char_p, _p)
+snd_ctl_elem_info_get_interface = _sig("snd_ctl_elem_info_get_interface", ctypes.c_int, _p)
+snd_ctl_elem_info_get_type = _sig("snd_ctl_elem_info_get_type", ctypes.c_int, _p)
+snd_ctl_elem_info_get_count = _sig("snd_ctl_elem_info_get_count", ctypes.c_uint, _p)
+snd_ctl_elem_info_get_min = _sig("snd_ctl_elem_info_get_min", ctypes.c_long, _p)
+snd_ctl_elem_info_get_max = _sig("snd_ctl_elem_info_get_max", ctypes.c_long, _p)
+snd_ctl_elem_info_get_items = _sig("snd_ctl_elem_info_get_items", ctypes.c_uint, _p)
+snd_ctl_elem_info_set_item = _sig("snd_ctl_elem_info_set_item", None, _p, ctypes.c_uint)
+snd_ctl_elem_info_get_item_name = _sig("snd_ctl_elem_info_get_item_name", ctypes.c_char_p, _p)
+snd_ctl_elem_info_is_readable = _sig("snd_ctl_elem_info_is_readable", ctypes.c_int, _p)
+snd_ctl_elem_info_is_writable = _sig("snd_ctl_elem_info_is_writable", ctypes.c_int, _p)
+snd_ctl_elem_info_is_tlv_readable = _sig("snd_ctl_elem_info_is_tlv_readable", ctypes.c_int, _p)
+snd_ctl_elem_info_get_id = _sig("snd_ctl_elem_info_get_id", None, _p, _p)
+
+snd_ctl_elem_id_malloc = _sig("snd_ctl_elem_id_malloc", ctypes.c_int, ctypes.POINTER(_p))
+snd_ctl_elem_id_free = _sig("snd_ctl_elem_id_free", None, _p)
+snd_ctl_get_dB_range = _sig("snd_ctl_get_dB_range", ctypes.c_int, _p, _p, ctypes.POINTER(ctypes.c_long), ctypes.POINTER(ctypes.c_long))
+
+snd_ctl_elem_value_malloc = _sig("snd_ctl_elem_value_malloc", ctypes.c_int, ctypes.POINTER(_p))
+snd_ctl_elem_value_free = _sig("snd_ctl_elem_value_free", None, _p)
+snd_ctl_elem_value_clear = _sig("snd_ctl_elem_value_clear", None, _p)
+snd_ctl_elem_value_set_numid = _sig("snd_ctl_elem_value_set_numid", None, _p, ctypes.c_uint)
+snd_ctl_elem_read = _sig("snd_ctl_elem_read", ctypes.c_int, _p, _p)
+snd_ctl_elem_write = _sig("snd_ctl_elem_write", ctypes.c_int, _p, _p)
+snd_ctl_elem_value_get_integer = _sig("snd_ctl_elem_value_get_integer", ctypes.c_long, _p, ctypes.c_uint)
+snd_ctl_elem_value_get_boolean = _sig("snd_ctl_elem_value_get_boolean", ctypes.c_int, _p, ctypes.c_uint)
+snd_ctl_elem_value_get_enumerated = _sig("snd_ctl_elem_value_get_enumerated", ctypes.c_uint, _p, ctypes.c_uint)
+snd_ctl_elem_value_set_integer = _sig("snd_ctl_elem_value_set_integer", None, _p, ctypes.c_uint, ctypes.c_long)
+snd_ctl_elem_value_set_boolean = _sig("snd_ctl_elem_value_set_boolean", None, _p, ctypes.c_uint, ctypes.c_long)
+snd_ctl_elem_value_set_enumerated = _sig("snd_ctl_elem_value_set_enumerated", None, _p, ctypes.c_uint, ctypes.c_uint)
+
+snd_ctl_event_malloc = _sig("snd_ctl_event_malloc", ctypes.c_int, ctypes.POINTER(_p))
+snd_ctl_event_get_type = _sig("snd_ctl_event_get_type", ctypes.c_int, _p)
+snd_ctl_event_elem_get_numid = _sig("snd_ctl_event_elem_get_numid", ctypes.c_uint, _p)
+snd_ctl_event_elem_get_mask = _sig("snd_ctl_event_elem_get_mask", ctypes.c_uint, _p)
+
+TYPE_BOOLEAN, TYPE_INTEGER, TYPE_ENUMERATED = 1, 2, 3
+TYPE_NAMES = {1: "bool", 2: "int", 3: "enum", 4: "bytes", 5: "iec958", 6: "int64"}
+IFACE_NAMES = {0: "CARD", 1: "HWDEP", 2: "MIXER", 3: "PCM", 4: "RAWMIDI", 5: "TIMER", 6: "SEQUENCER"}
+EVENT_MASK_REMOVE = 0xFFFFFFFF
+
+# Kernel control names carry ALSA's role suffixes; the UI works with the
+# short, human names ("Line In 1 Gain") so it never has to know about them.
+_SUFFIX = re.compile(r"\s+(Capture|Playback)?\s*(Volume|Switch|Enum|Route)$")
+
+
+def short_name(name):
+    return _SUFFIX.sub("", name).strip()
+
+
+def emit(obj):
+    try:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        sys.exit(0)
+
+
+# ------------------------------------------------------------------ device
+
+
+def find_card():
+    """Return (card_index, info) for the first Focusrite USB card, or (None, None)."""
+    try:
+        entries = sorted(os.listdir("/proc/asound"))
+    except OSError:
+        return None, None
+    for entry in entries:
+        m = re.fullmatch(r"card(\d+)", entry)
+        if not m:
+            continue
+        base = os.path.join("/proc/asound", entry)
+        try:
+            with open(os.path.join(base, "usbid")) as f:
+                usbid = f.read().strip()
+        except OSError:
+            continue
+        if not usbid.lower().startswith(FOCUSRITE_VENDOR + ":"):
+            continue
+        name = ""
+        try:
+            with open(os.path.join(base, "id")) as f:
+                cid = f.read().strip()
+            with open("/proc/asound/cards") as f:
+                for line in f:
+                    mm = re.match(r"\s*%s\s+\[[^\]]*\]:\s*\S+\s+-\s+(.+)$" % m.group(1), line)
+                    if mm:
+                        name = mm.group(1).strip()
+        except OSError:
+            cid = ""
+        return int(m.group(1)), {"usbid": usbid, "id": cid, "name": name or "Focusrite Scarlett"}
+    return None, None
+
+
+def read_serial(card):
+    # The USB serial is part of PipeWire's device name; sysfs has it directly.
+    try:
+        dev = os.path.realpath("/sys/class/sound/card%d/device" % card)
+        with open(os.path.join(os.path.dirname(dev), "serial")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+class Card:
+    def __init__(self, index):
+        self.index = index
+        self.handle = _p()
+        rc = snd_ctl_open(ctypes.byref(self.handle), ("hw:%d" % index).encode(), 0)
+        if rc < 0:
+            raise OSError(-rc, "snd_ctl_open failed")
+        self.info = _p()
+        self.value = _p()
+        self.elem_id = _p()
+        snd_ctl_elem_info_malloc(ctypes.byref(self.info))
+        snd_ctl_elem_value_malloc(ctypes.byref(self.value))
+        snd_ctl_elem_id_malloc(ctypes.byref(self.elem_id))
+        self.controls = {}      # short name -> descriptor
+        self.by_numid = {}      # numid -> short name
+        self.enumerate()
+
+    def close(self):
+        if self.handle:
+            snd_ctl_close(self.handle)
+            self.handle = _p()
+
+    def enumerate(self):
+        lst = _p()
+        snd_ctl_elem_list_malloc(ctypes.byref(lst))
+        try:
+            snd_ctl_elem_list(self.handle, lst)
+            count = snd_ctl_elem_list_get_count(lst)
+            snd_ctl_elem_list_alloc_space(lst, count)
+            snd_ctl_elem_list(self.handle, lst)
+            numids = [snd_ctl_elem_list_get_numid(lst, i) for i in range(count)]
+            snd_ctl_elem_list_free_space(lst)
+        finally:
+            snd_ctl_elem_list_free(lst)
+
+        self.controls, self.by_numid = {}, {}
+        for numid in numids:
+            desc = self.describe(numid)
+            if desc is None:
+                continue
+            self.controls[desc["name"]] = desc
+            self.by_numid[numid] = desc["name"]
+
+    def describe(self, numid):
+        snd_ctl_elem_info_set_numid(self.info, numid)
+        if snd_ctl_elem_info(self.handle, self.info) < 0:
+            return None
+        etype = snd_ctl_elem_info_get_type(self.info)
+        if etype not in (TYPE_BOOLEAN, TYPE_INTEGER, TYPE_ENUMERATED):
+            return None
+        raw = snd_ctl_elem_info_get_name(self.info).decode(errors="replace")
+        desc = {
+            "numid": numid,
+            "full": raw,
+            "name": short_name(raw),
+            "iface": IFACE_NAMES.get(snd_ctl_elem_info_get_interface(self.info), "?"),
+            "type": TYPE_NAMES.get(etype, "?"),
+            "count": snd_ctl_elem_info_get_count(self.info),
+            "rw": bool(snd_ctl_elem_info_is_writable(self.info)),
+            "readable": bool(snd_ctl_elem_info_is_readable(self.info)),
+        }
+        if etype == TYPE_INTEGER:
+            desc["min"] = snd_ctl_elem_info_get_min(self.info)
+            desc["max"] = snd_ctl_elem_info_get_max(self.info)
+            if snd_ctl_elem_info_is_tlv_readable(self.info):
+                snd_ctl_elem_info_get_id(self.info, self.elem_id)
+                lo, hi = ctypes.c_long(), ctypes.c_long()
+                if snd_ctl_get_dB_range(self.handle, self.elem_id, ctypes.byref(lo), ctypes.byref(hi)) >= 0:
+                    desc["dbMin"] = lo.value / 100.0
+                    desc["dbMax"] = hi.value / 100.0
+        elif etype == TYPE_ENUMERATED:
+            items = []
+            for i in range(snd_ctl_elem_info_get_items(self.info)):
+                snd_ctl_elem_info_set_item(self.info, i)
+                snd_ctl_elem_info(self.handle, self.info)
+                items.append(snd_ctl_elem_info_get_item_name(self.info).decode(errors="replace"))
+            desc["items"] = items
+        # A duplicated short name (unlikely) must not shadow the first one.
+        if desc["name"] in self.controls:
+            desc["name"] = raw
+        return desc
+
+    def read(self, desc):
+        snd_ctl_elem_value_clear(self.value)
+        snd_ctl_elem_value_set_numid(self.value, desc["numid"])
+        if snd_ctl_elem_read(self.handle, self.value) < 0:
+            return None
+        n = desc["count"]
+        if desc["type"] == "bool":
+            return [bool(snd_ctl_elem_value_get_boolean(self.value, i)) for i in range(n)]
+        if desc["type"] == "enum":
+            return [snd_ctl_elem_value_get_enumerated(self.value, i) for i in range(n)]
+        return [snd_ctl_elem_value_get_integer(self.value, i) for i in range(n)]
+
+    def read_numid(self, numid):
+        name = self.by_numid.get(numid)
+        return self.read(self.controls[name]) if name else None
+
+    def write(self, numid, values):
+        name = self.by_numid.get(numid)
+        if not name:
+            raise KeyError("unknown control %d" % numid)
+        desc = self.controls[name]
+        if not desc["rw"]:
+            raise PermissionError("%s is read-only" % desc["name"])
+        current = self.read(desc) or [0] * desc["count"]
+        if len(values) == 1 and desc["count"] > 1:
+            values = values * desc["count"]
+        snd_ctl_elem_value_clear(self.value)
+        snd_ctl_elem_value_set_numid(self.value, numid)
+        for i in range(desc["count"]):
+            v = int(values[i]) if i < len(values) else int(current[i])
+            if desc["type"] == "bool":
+                snd_ctl_elem_value_set_boolean(self.value, i, 1 if v else 0)
+            elif desc["type"] == "enum":
+                v = max(0, min(len(desc.get("items", [])) - 1, v))
+                snd_ctl_elem_value_set_enumerated(self.value, i, v)
+            else:
+                v = max(desc["min"], min(desc["max"], v))
+                snd_ctl_elem_value_set_integer(self.value, i, v)
+        rc = snd_ctl_elem_write(self.handle, self.value)
+        if rc < 0:
+            raise OSError(-rc, os.strerror(-rc))
+
+    def snapshot(self):
+        out = {}
+        for name, desc in self.controls.items():
+            if name == "Level Meter" or not desc["readable"]:
+                continue
+            d = dict(desc)
+            d["values"] = self.read(desc)
+            out[name] = d
+        return out
+
+    def meter_numid(self):
+        desc = self.controls.get("Level Meter")
+        return desc["numid"] if desc else None
+
+    def subscribe(self):
+        snd_ctl_subscribe_events(self.handle, 1)
+        count = snd_ctl_poll_descriptors_count(self.handle)
+        fds = (_Pollfd * max(1, count))()
+        snd_ctl_poll_descriptors(self.handle, fds, count)
+        self.event = _p()
+        snd_ctl_event_malloc(ctypes.byref(self.event))
+        snd_ctl_nonblock(self.handle, 1)
+        return [fds[i].fd for i in range(count)]
+
+    def drain_events(self):
+        """Read pending events. Returns (changed_numids, structure_changed)."""
+        changed, structural = set(), False
+        while True:
+            rc = snd_ctl_read(self.handle, self.event)
+            if rc == 0 or rc == -11:  # nothing left / EAGAIN
+                break
+            if rc < 0:
+                raise OSError(-rc, "device gone")
+            numid = snd_ctl_event_elem_get_numid(self.event)
+            mask = snd_ctl_event_elem_get_mask(self.event)
+            if mask == EVENT_MASK_REMOVE or mask & 0x4:  # removed / added
+                structural = True
+            changed.add(numid)
+        return changed, structural
+
+
+# ------------------------------------------------------------------- clock
+
+
+def pw_settings():
+    try:
+        out = subprocess.run(["pw-metadata", "-n", "settings", "0"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    settings = {}
+    for m in re.finditer(r"key:'([^']+)' value:'([^']*)'", out):
+        settings[m.group(1)] = m.group(2)
+    return settings
+
+
+def pw_set(key, value):
+    subprocess.run(["pw-metadata", "-n", "settings", "0", key, str(value)],
+                   capture_output=True, timeout=3)
+
+
+def parse_rates(text):
+    return [int(x) for x in re.findall(r"\d+", text or "")]
+
+
+def stream_status(card):
+    """Actual hardware state from the USB-audio proc file."""
+    result = {"playback": None, "capture": None}
+    if card is None:
+        return result
+    try:
+        with open("/proc/asound/card%d/stream0" % card) as f:
+            text = f.read()
+    except OSError:
+        return result
+    for section in ("Playback", "Capture"):
+        m = re.search(section + r":\s*\n\s*Status:\s*(\w+)(?:.*?\n\s*Momentary freq = (\d+) Hz)?", text, re.S)
+        if m:
+            running = m.group(1) == "Running"
+            result[section.lower()] = {"running": running, "rate": int(m.group(2)) if running and m.group(2) else None}
+    rates = re.search(r"Rates:\s*([\d, ]+)", text)
+    result["supported"] = parse_rates(rates.group(1)) if rates else RATES
+    return result
+
+
+def load_prefs():
+    try:
+        with open(PREFS_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_prefs(prefs):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = PREFS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(prefs, f, indent=2)
+    os.replace(tmp, PREFS_PATH)
+
+
+def write_pw_conf(rate_mode, rate):
+    """Persist the rate for the next PipeWire start (login, reboot)."""
+    os.makedirs(PW_CONF_DIR, exist_ok=True)
+    if rate_mode == "auto":
+        default_rate, allowed = 48000, RATES
+    else:
+        default_rate, allowed = rate, [rate]
+    body = (
+        "# Written by the Omarchy Scarlett plugin (scarlett-ctl). Edit from the panel.\n"
+        "context.properties = {\n"
+        "    default.clock.rate          = %d\n"
+        "    default.clock.allowed-rates = [ %s ]\n"
+        "}\n" % (default_rate, " ".join(str(r) for r in allowed))
+    )
+    tmp = PW_CONF_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(body)
+    os.replace(tmp, PW_CONF_PATH)
+
+
+def apply_rate(arg):
+    prefs = load_prefs()
+    if str(arg) == "auto":
+        pw_set("clock.allowed-rates", "[ %s ]" % " ".join(str(r) for r in RATES))
+        pw_set("clock.rate", 48000)
+        pw_set("clock.force-rate", 0)
+        prefs["rateMode"] = "auto"
+        write_pw_conf("auto", 48000)
+    else:
+        rate = int(arg)
+        if rate not in RATES:
+            raise ValueError("unsupported rate %d" % rate)
+        pw_set("clock.allowed-rates", "[ %d ]" % rate)
+        pw_set("clock.rate", rate)
+        # force-rate switches a running graph immediately; allowed-rates and
+        # clock.rate alone only apply once the device next goes idle.
+        pw_set("clock.force-rate", rate)
+        prefs["rateMode"] = "fixed"
+        prefs["rate"] = rate
+        write_pw_conf("fixed", rate)
+    save_prefs(prefs)
+
+
+def apply_buffer(arg):
+    prefs = load_prefs()
+    q = 0 if str(arg) == "auto" else int(arg)
+    if q and q not in QUANTA:
+        raise ValueError("unsupported buffer size %d" % q)
+    pw_set("clock.force-quantum", q)
+    prefs["quantum"] = q
+    save_prefs(prefs)
+
+
+def restore_prefs():
+    """Re-apply runtime-only settings (buffer size) after PipeWire restarts."""
+    prefs = load_prefs()
+    q = int(prefs.get("quantum", 0) or 0)
+    if q and pw_settings().get("clock.force-quantum") != str(q):
+        pw_set("clock.force-quantum", q)
+
+
+def clock_info(card):
+    s = pw_settings()
+    prefs = load_prefs()
+    force_rate = int(s.get("clock.force-rate", "0") or 0)
+    allowed = parse_rates(s.get("clock.allowed-rates"))
+    if force_rate:
+        mode, rate = "fixed", force_rate
+    elif len(allowed) == 1:
+        mode, rate = "fixed", allowed[0]
+    else:
+        mode, rate = "auto", int(s.get("clock.rate", "48000") or 48000)
+    status = stream_status(card)
+    active = None
+    for key in ("playback", "capture"):
+        st = status.get(key)
+        if st and st.get("rate"):
+            active = st["rate"]
+            break
+    return {
+        "type": "clock",
+        "mode": mode,
+        "rate": rate,
+        "activeRate": active,
+        "running": active is not None,
+        "allowed": allowed,
+        "supported": status.get("supported", RATES),
+        "quantum": int(s.get("clock.quantum", "1024") or 1024),
+        "forceQuantum": int(s.get("clock.force-quantum", "0") or 0),
+        "minQuantum": int(s.get("clock.min-quantum", "32") or 32),
+        "maxQuantum": int(s.get("clock.max-quantum", "2048") or 2048),
+        "persisted": os.path.exists(PW_CONF_PATH),
+        "prefs": prefs,
+    }
+
+
+# ---------------------------------------------------------------- firmware
+#
+# Updates are done by Geoffrey Bennett's `scarlett2` tool (AUR: scarlett2)
+# with Focusrite's redistributable images (AUR: scarlett2-firmware), which
+# talk to the kernel driver's hwdep interface — no root needed. The tool resets
+# the interface to factory defaults as part of an update, so the daemon saves
+# every writable control first and writes them back once the device returns.
+
+FIRMWARE_DIRS = ["/usr/lib/firmware/scarlett2", "/usr/lib/firmware/scarlett4"]
+FW_RESTORE_PATH = os.path.join(STATE_DIR, "firmware-restore.json")
+# Dev aid: when this file exists the daemon pretends a newer image is available
+# and runs a fake update that never touches the hardware.
+FW_SIMULATE_PATH = os.path.join(STATE_DIR, "fw-simulate")
+
+# Controls that must not be replayed: momentary actions and read-only status.
+FW_SKIP = re.compile(r"Autogain$|Autogain Status$|^Sync Status$|Level Meter|Channel Map|Validity|Firmware Version")
+
+
+def usb_pid(usbid):
+    try:
+        return int(usbid.split(":")[1], 16)
+    except (IndexError, ValueError, AttributeError):
+        return None
+
+
+def read_fw_header(path):
+    """(pid, version) from a Scarlett firmware image, or None."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(20)
+    except OSError:
+        return None
+    if len(head) < 20 or head[:8] != b"SCARLETT":
+        return None
+    vid = int.from_bytes(head[8:10], "big")
+    pid = int.from_bytes(head[10:12], "big")
+    version = int.from_bytes(head[12:16], "big")
+    if vid != int(FOCUSRITE_VENDOR, 16):
+        return None
+    return pid, version
+
+
+def available_firmware(pid):
+    """All images for this product, newest first: [{version, path}]."""
+    found = {}
+    for d in FIRMWARE_DIRS:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".bin"):
+                continue
+            path = os.path.join(d, name)
+            hdr = read_fw_header(path)
+            if hdr and hdr[0] == pid and hdr[1] not in found:
+                found[hdr[1]] = path
+    return [{"version": v, "path": found[v]} for v in sorted(found, reverse=True)]
+
+
+def firmware_info(card, usbid):
+    tool = shutil.which("scarlett2")
+    pid = usb_pid(usbid)
+    current = None
+    if card is not None:
+        desc = card.controls.get("Firmware Version")
+        vals = card.read(desc) if desc else None
+        current = vals[0] if vals else None
+    images = available_firmware(pid) if pid is not None else []
+    latest = images[0]["version"] if images else None
+    simulate = os.path.exists(FW_SIMULATE_PATH)
+    if simulate and current:
+        latest = current + 100
+    return {
+        "type": "firmware",
+        "current": current,
+        "latest": latest,
+        "updateAvailable": bool(current and latest and latest > current),
+        "images": len(images),
+        "tool": bool(tool) or simulate,
+        "simulate": simulate,
+        "firmwarePackage": any(os.path.isdir(d) for d in FIRMWARE_DIRS),
+        "pendingRestore": os.path.exists(FW_RESTORE_PATH),
+    }
+
+
+def save_restore_snapshot(card):
+    values = {}
+    order = []
+    for name, desc in card.controls.items():
+        if not desc["rw"] or FW_SKIP.search(name):
+            continue
+        v = card.read(desc)
+        if v is None:
+            continue
+        values[name] = [int(x) for x in v]
+        order.append(name)
+    # Link copies the selected input's settings onto the other one, so it goes
+    # first and the per-input values land on top of it.
+    order.sort(key=lambda n: 0 if n.endswith("Link") else 1)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(FW_RESTORE_PATH, "w") as f:
+        json.dump({"order": order, "values": values, "saved": time.time()}, f)
+
+
+def apply_restore_snapshot(card):
+    """Write the saved controls back. Returns (restored, failed)."""
+    try:
+        with open(FW_RESTORE_PATH) as f:
+            snap = json.load(f)
+    except (OSError, ValueError):
+        return 0, 0
+    ok = bad = 0
+    for name in snap.get("order", []):
+        desc = card.controls.get(name)
+        if not desc or not desc["rw"]:
+            bad += 1
+            continue
+        try:
+            card.write(desc["numid"], snap["values"][name])
+            ok += 1
+        except OSError:
+            bad += 1
+    os.remove(FW_RESTORE_PATH)
+    return ok, bad
+
+
+# Weighted phases of `scarlett2 update`, for a single overall percentage.
+FW_PHASES = [
+    ("reset", "Resetting configuration", 5),
+    ("erase", "Erasing old firmware", 25),
+    ("write", "Writing firmware", 65),
+    ("reboot", "Rebooting interface", 5),
+]
+
+
+class FirmwareJob:
+    """Runs the updater as a child and turns its \\r-progress into events."""
+
+    def __init__(self, card_index, simulate):
+        if simulate:
+            script = (
+                "import sys,time\n"
+                "p=lambda s:(sys.stdout.write(s),sys.stdout.flush())\n"
+                "p('Resetting to default configuration...\\n')\n"
+                "for i in range(0,101,20): p('\\rErase progress: %d%%'%i); time.sleep(0.15)\n"
+                "p('\\rErase progress: Done!\\nErasing upgrade firmware...\\n')\n"
+                "for i in range(0,101,10): p('\\rErase progress: %d%%'%i); time.sleep(0.12)\n"
+                "p('\\rErase progress: Done!\\n')\n"
+                "for i in range(0,101,4): p('\\rFirmware write progress: %d%%'%i); time.sleep(0.08)\n"
+                "p('\\rFirmware write progress: Done!\\nRebooting interface...\\n')\n"
+            )
+            cmd = [sys.executable, "-c", script]
+        else:
+            cmd = ["stdbuf", "-o0", "-e0", "scarlett2", "-c", str(card_index), "update"]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        self.fd = self.proc.stdout.fileno()
+        self.buf = ""
+        self.phase = "reset"
+        self.erase_count = 0
+        self.log = []
+        self.simulate = simulate
+
+    def progress(self, pct):
+        total = 0
+        for key, _label, weight in FW_PHASES:
+            if key == self.phase:
+                return int(total + weight * max(0, min(100, pct)) / 100)
+            total += weight
+        return 100
+
+    def label(self):
+        return dict((k, l) for k, l, _w in FW_PHASES).get(self.phase, "Updating")
+
+    def feed(self, chunk):
+        """Parse output; returns a list of progress events."""
+        events = []
+        self.buf += chunk.decode(errors="replace")
+        parts = re.split(r"[\r\n]", self.buf)
+        self.buf = parts.pop()
+        for line in parts:
+            line = line.strip()
+            if not line:
+                continue
+            self.log.append(line)
+            pct = 0
+            if line.startswith("Resetting"):
+                self.phase = "reset"
+            elif line.startswith("Erasing upgrade"):
+                self.phase = "erase"
+            elif line.startswith("Erase progress"):
+                m = re.search(r"(\d+)%", line)
+                pct = 100 if "Done" in line else (int(m.group(1)) if m else 0)
+                if "Done" in line and self.phase == "reset":
+                    pct = 100
+            elif line.startswith("Firmware write progress"):
+                self.phase = "write"
+                m = re.search(r"(\d+)%", line)
+                pct = 100 if "Done" in line else (int(m.group(1)) if m else 0)
+            elif line.startswith("Rebooting"):
+                self.phase = "reboot"
+                pct = 50
+            else:
+                continue
+            events.append({"type": "fwprogress", "phase": self.phase, "label": self.label(),
+                           "percent": self.progress(pct), "line": line})
+        return events
+
+
+# ------------------------------------------------------------------ daemon
+
+
+class Daemon:
+    METER_INTERVAL = 0.04
+    CLOCK_INTERVAL = 1.5
+    RESCAN_INTERVAL = 2.0
+
+    def __init__(self):
+        self.card = None
+        self.fds = []
+        self.meters = False
+        self.stdin_buf = b""
+        self.pending_state = False
+        self.last_meter = 0.0
+        self.last_clock = 0.0
+        self.last_scan = 0.0
+        self.usbid = ""
+        self.fw_job = None
+        self.fw_restore_due = 0.0
+
+    def connect(self):
+        index, info = find_card()
+        if index is None:
+            return False
+        try:
+            self.card = Card(index)
+            self.fds = self.card.subscribe()
+        except OSError as e:
+            emit({"type": "error", "message": "cannot open card %d: %s" % (index, e)})
+            self.card = None
+            return False
+        self.usbid = info["usbid"]
+        emit({"type": "device", "connected": True, "card": index, "name": info["name"],
+              "usbid": info["usbid"], "serial": read_serial(index)})
+        if os.path.exists(FW_RESTORE_PATH) and not self.fw_job:
+            # Back from a firmware update: give the driver a moment, then put
+            # the user's settings back.
+            self.fw_restore_due = time.monotonic() + 1.5
+        self.send_state()
+        self.send_clock()
+        self.send_firmware()
+        return True
+
+    def disconnect(self):
+        if self.card:
+            self.card.close()
+        self.card, self.fds = None, []
+        emit({"type": "device", "connected": False})
+
+    def send_state(self):
+        if self.card:
+            emit({"type": "state", "controls": self.card.snapshot()})
+        self.pending_state = False
+
+    def send_firmware(self):
+        emit(firmware_info(self.card, self.usbid))
+
+    def start_firmware_update(self):
+        if self.fw_job:
+            raise RuntimeError("an update is already running")
+        if not self.card:
+            raise RuntimeError("no interface connected")
+        info = firmware_info(self.card, self.usbid)
+        if not info["tool"]:
+            raise RuntimeError("install the scarlett2 and scarlett2-firmware packages first")
+        if not info["updateAvailable"]:
+            raise RuntimeError("firmware is already up to date")
+        save_restore_snapshot(self.card)
+        self.meters = False
+        self.fw_job = FirmwareJob(self.card.index, info["simulate"])
+        emit({"type": "fwprogress", "phase": "reset", "label": "Saving settings", "percent": 0,
+              "from": info["current"], "to": info["latest"]})
+
+    def finish_firmware_update(self):
+        job, self.fw_job = self.fw_job, None
+        job.proc.stdout.close()
+        rc = job.proc.wait()
+        ok = rc == 0
+        emit({"type": "fwresult", "ok": ok, "stage": "flashed" if ok else "failed",
+              "message": "" if ok else (job.log[-1] if job.log else "updater exited with %d" % rc),
+              "log": job.log[-12:]})
+        if not ok:
+            # Nothing was reset if the tool bailed out early; keep the snapshot
+            # only if the device did go through a reset.
+            if not any(l.startswith("Resetting") for l in job.log) and os.path.exists(FW_RESTORE_PATH):
+                os.remove(FW_RESTORE_PATH)
+            else:
+                self.fw_restore_due = time.monotonic() + 1.5
+        elif job.simulate:
+            self.fw_restore_due = time.monotonic() + 0.5
+
+    def restore_after_update(self):
+        self.fw_restore_due = 0.0
+        if not self.card:
+            return
+        ok, bad = apply_restore_snapshot(self.card)
+        emit({"type": "fwresult", "ok": True, "stage": "restored", "restored": ok, "failed": bad})
+        self.send_firmware()
+
+    def send_clock(self):
+        emit(clock_info(self.card.index if self.card else None))
+        self.last_clock = time.monotonic()
+
+    def handle_command(self, line):
+        parts = line.strip().split()
+        if not parts:
+            return
+        cmd, args = parts[0], parts[1:]
+        try:
+            if self.fw_job and cmd in ("set", "rate", "buffer"):
+                raise RuntimeError("busy updating firmware")
+            if cmd == "set" and len(args) == 2 and self.card:
+                self.card.write(int(args[0]), [int(float(v)) for v in args[1].split(",")])
+                # The change event echoes back through the ALSA subscription.
+            elif cmd == "meters":
+                self.meters = bool(args) and args[0] == "on"
+                if self.meters:
+                    self.send_clock()
+            elif cmd == "rate" and args:
+                apply_rate(args[0])
+                time.sleep(0.25)
+                self.send_clock()
+            elif cmd == "buffer" and args:
+                apply_buffer(args[0])
+                self.send_clock()
+            elif cmd == "firmware":
+                self.send_firmware()
+            elif cmd == "firmware-update":
+                self.start_firmware_update()
+            elif cmd == "refresh":
+                if self.card:
+                    self.card.enumerate()
+                self.send_state()
+                self.send_clock()
+            else:
+                emit({"type": "error", "message": "bad command: " + line.strip()})
+        except Exception as e:  # report, never die on a bad request
+            emit({"type": "error", "message": "%s: %s" % (cmd, e)})
+
+    def read_stdin(self):
+        chunk = os.read(sys.stdin.fileno(), 4096)
+        if not chunk:
+            return False
+        self.stdin_buf += chunk
+        while b"\n" in self.stdin_buf:
+            line, self.stdin_buf = self.stdin_buf.split(b"\n", 1)
+            self.handle_command(line.decode(errors="replace"))
+        return True
+
+    def run(self):
+        restore_prefs()
+        if not self.connect():
+            emit({"type": "device", "connected": False})
+        stdin_fd = sys.stdin.fileno()
+        stdin_open = True
+        while True:
+            now = time.monotonic()
+            timeout = 1.0
+            if self.meters and self.card:
+                timeout = max(0.0, self.METER_INTERVAL - (now - self.last_meter))
+            if self.pending_state:
+                timeout = min(timeout, 0.03)
+            if not self.card:
+                timeout = min(timeout, self.RESCAN_INTERVAL)
+
+            if self.fw_restore_due:
+                timeout = min(timeout, max(0.0, self.fw_restore_due - now))
+            fw_fd = self.fw_job.fd if self.fw_job else None
+            watch = list(self.fds) + ([stdin_fd] if stdin_open else []) + ([fw_fd] if fw_fd is not None else [])
+            try:
+                ready, _, _ = select.select(watch, [], [], timeout)
+            except InterruptedError:
+                continue
+
+            if stdin_open and stdin_fd in ready:
+                if not self.read_stdin():
+                    return  # the shell went away
+
+            if fw_fd is not None and fw_fd in ready:
+                chunk = os.read(fw_fd, 4096)
+                if chunk:
+                    for ev in self.fw_job.feed(chunk):
+                        emit(ev)
+                else:
+                    self.finish_firmware_update()
+
+            if self.fw_restore_due and time.monotonic() >= self.fw_restore_due and self.card:
+                self.restore_after_update()
+
+            if self.card and any(fd in ready for fd in self.fds):
+                try:
+                    changed, structural = self.card.drain_events()
+                    if structural:
+                        self.card.enumerate()
+                    meter = self.card.meter_numid()
+                    if changed - {meter}:
+                        # Coalesce bursts (a turning gain knob) into one snapshot.
+                        self.pending_state = True
+                except OSError:
+                    self.disconnect()
+                    continue
+
+            now = time.monotonic()
+            if self.pending_state and not (self.fds and any(fd in ready for fd in self.fds)):
+                self.send_state()
+
+            if self.card and self.meters and not self.fw_job and now - self.last_meter >= self.METER_INTERVAL:
+                self.last_meter = now
+                numid = self.card.meter_numid()
+                if numid:
+                    try:
+                        v = self.card.read_numid(numid)
+                    except OSError:
+                        v = None
+                    if v is None and not os.path.exists("/proc/asound/card%d" % self.card.index):
+                        self.disconnect()
+                        continue
+                    if v is not None:
+                        emit({"type": "meters", "v": v})
+
+            if self.card and self.meters and now - self.last_clock >= self.CLOCK_INTERVAL:
+                self.send_clock()
+
+            if not self.card and now - self.last_scan >= self.RESCAN_INTERVAL:
+                self.last_scan = now
+                self.connect()
+
+
+# --------------------------------------------------------------------- cli
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "state"
+    if cmd == "daemon":
+        Daemon().run()
+        return 0
+    if cmd == "state":
+        index, info = find_card()
+        if index is None:
+            print(json.dumps({"connected": False}))
+            return 1
+        card = Card(index)
+        print(json.dumps({"connected": True, "card": index, "device": info,
+                          "controls": card.snapshot(), "clock": clock_info(index)}, indent=2))
+        return 0
+    if cmd == "rate" and len(argv) > 2:
+        apply_rate(argv[2])
+        time.sleep(0.3)
+        index, _ = find_card()
+        print(json.dumps(clock_info(index), indent=2))
+        return 0
+    if cmd == "buffer" and len(argv) > 2:
+        apply_buffer(argv[2])
+        return 0
+    if cmd == "firmware":
+        index, info = find_card()
+        card = Card(index) if index is not None else None
+        print(json.dumps(firmware_info(card, info["usbid"] if info else ""), indent=2))
+        return 0
+    if cmd == "clock":
+        index, _ = find_card()
+        print(json.dumps(clock_info(index), indent=2))
+        return 0
+    print(__doc__.strip())
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

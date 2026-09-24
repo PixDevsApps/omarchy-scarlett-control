@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.pixdevsapps.scarlett-control",
+  "name": "Scarlett Control",
+  "version": "1.0.0",
+  "author": "Fredrick Thorsen",
+  "license": "MIT",
+  "description": "Control center for the Focusrite Scarlett 2i2 4th Gen: sample rate and buffer size, preamp gain, Air, Inst, 48V, Auto Gain, Clip Safe, direct monitoring, live meters and firmware updates.",
+  "homepage": "https://github.com/PixDevsApps/omarchy-scarlett-control",
+  "repository": "https://github.com/PixDevsApps/omarchy-scarlett-control",
+  "keywords": [
+    "audio",
+    "focusrite",
+    "scarlett",
+    "sample-rate",
+    "firmware",
+    "interface"
+  ],
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Scarlett Control",
+    "description": "Sample rate, preamps, direct monitor and meters for a Focusrite Scarlett",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
