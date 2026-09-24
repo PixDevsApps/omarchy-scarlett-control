@@ -237,12 +237,9 @@ omarchy restart audio
 
 ## Development
 
-```bash
-git clone https://github.com/PixDevsApps/omarchy-scarlett-control.git
-cd omarchy-scarlett-control
-./tools/dev-sync.sh          # copy into ~/.config/omarchy/plugins and restart the shell
-omarchy plugin validate .
-```
+Work in a checkout of this repository. `tools/dev-sync.sh` copies the working
+tree into `~/.config/omarchy/plugins/` and restarts the shell, and
+`omarchy plugin validate .` checks the manifest.
 
 The shell keeps plugin components cached in memory after they first load, so
 `dev-sync.sh` restarts the shell to pick up QML changes.
